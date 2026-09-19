@@ -116,6 +116,18 @@ SILENCE_GATE_SECS = 0.3               # stop sending after this many seconds of 
 # Default Linux pipe is 64KB (~2s at 32KB/s). We use 8KB (~250ms).
 SPK_PIPE_BUF_SIZE = 8192
 
+# Mic pipe staleness control. While no app is recording, the PA source is
+# suspended and consumes nothing: audio left in the FIFO goes stale and would
+# be played when a recording starts ("old audio + gap" artifact). We shrink the
+# FIFO buffer and cap our unwritten backlog so at most ~a few hundred ms of
+# stale audio can ever exist; the rest is drained (see drain_fifo).
+MIC_PIPE_BUF_SIZE = 8192                 # ~250ms — limits stale backlog in the FIFO
+MIC_PENDING_CAP = MULTICAST_PACKET_SIZE  # at most one 160ms packet queued unwritten
+
+# Linux fcntl pipe-buffer commands (not exposed by Python's fcntl on old kernels)
+F_SETPIPE_SZ = 1031
+F_GETPIPE_SZ = 1032
+
 # PulseAudio
 PA_SOURCE_NAME = "g1_microphone"
 PA_SINK_NAME = "g1_speaker"
@@ -343,7 +355,10 @@ def mic_thread(shutdown_event: threading.Event):
 
     Error handling:
       - BrokenPipeError: PA suspended the source → close and retry pipe
-      - BlockingIOError: PA pipe buffer full → drop packet (not harmful)
+      - BlockingIOError: PA pipe buffer full (source idle) → drain stale FIFO
+        contents so a new recording starts with fresh audio
+      - Partial non-blocking writes: remainder is kept and completed later
+        (bytes never lost or misaligned)
       - socket.timeout: no data from PC1 → keep waiting
       - Any other error → log, close resources, retry after backoff
     """
@@ -373,8 +388,10 @@ def mic_thread(shutdown_event: threading.Event):
 
     sock = None
     pipe_fd = None
+    pending = bytearray()        # unwritten PCM (partial-write remainder / backlog)
+    full_streak = 0              # consecutive "pipe full" events → consumer idle
     bytes_written = 0
-    packets_dropped = 0
+    stale_bytes = 0
     last_stats = time.time()
 
     try:
@@ -398,7 +415,15 @@ def mic_thread(shutdown_event: threading.Event):
             if pipe_fd is None:
                 try:
                     pipe_fd = os.open(MIC_PIPE, os.O_WRONLY | os.O_NONBLOCK)
-                    logger.info("Mic pipe opened for writing")
+                    # Shrink the FIFO buffer so stale audio can't accumulate
+                    try:
+                        fcntl.fcntl(pipe_fd, F_SETPIPE_SZ, MIC_PIPE_BUF_SIZE)
+                        logger.info("Mic pipe opened for writing (buffer=%d bytes)",
+                                    fcntl.fcntl(pipe_fd, F_GETPIPE_SZ))
+                    except OSError:
+                        logger.info("Mic pipe opened for writing")
+                    pending.clear()
+                    full_streak = 0
                 except OSError:
                     # PA hasn't opened read end yet (source suspended) — keep trying
                     time.sleep(0.5)
@@ -419,36 +444,59 @@ def mic_thread(shutdown_event: threading.Event):
                 time.sleep(0.1)
                 continue
 
-            # Write to PA pipe
-            try:
-                os.write(pipe_fd, data)
-                bytes_written += len(data)
-            except BrokenPipeError:
-                # PA closed the read end (source suspended/removed)
-                logger.debug("Mic pipe broken — PA suspended source, will retry")
-                _close_fd(pipe_fd)
-                pipe_fd = None
-                time.sleep(0.2)
-                continue
-            except BlockingIOError:
-                # Pipe buffer full — drop this packet. Not harmful; PA will catch up.
-                packets_dropped += 1
-                continue
-            except OSError as e:
-                logger.warning("Mic pipe write error: %s", e)
-                _close_fd(pipe_fd)
-                pipe_fd = None
-                time.sleep(0.2)
-                continue
+            # Queue the packet, then flush to the PA pipe.
+            # Mic packets (5120 B) exceed PIPE_BUF (4096), so a non-blocking
+            # write can complete PARTIALLY: any remainder is kept in `pending`
+            # and completed on the next flush — bytes are never lost, the
+            # byte stream never misaligns.
+            pending.extend(data)
+
+            # Staleness cap: while nobody records, keep at most one packet
+            # queued unwritten (drop oldest bytes — even count, stays aligned).
+            if len(pending) > MIC_PENDING_CAP:
+                stale_bytes += len(pending) - MIC_PENDING_CAP
+                del pending[:len(pending) - MIC_PENDING_CAP]
+
+            while pending and pipe_fd is not None:
+                try:
+                    n = os.write(pipe_fd, pending)
+                    del pending[:n]
+                    full_streak = 0
+                    bytes_written += n
+                except BlockingIOError:
+                    # FIFO full — nobody is consuming right now. If this lasts
+                    # ≥2 packets (~320ms) the source is idle: drain the stale
+                    # FIFO contents so a recording started next hears fresh
+                    # audio instead of seconds of old data.
+                    full_streak += 1
+                    if full_streak >= 2:
+                        stale_bytes += drain_fifo(MIC_PIPE)
+                        full_streak = 0
+                        continue  # pipe is empty now — retry immediately
+                    break
+                except BrokenPipeError:
+                    # PA closed the read end (source suspended/removed)
+                    logger.debug("Mic pipe broken — PA suspended source, will retry")
+                    _close_fd(pipe_fd)
+                    pipe_fd = None
+                    pending.clear()
+                    time.sleep(0.2)
+                except OSError as e:
+                    logger.warning("Mic pipe write error: %s", e)
+                    _close_fd(pipe_fd)
+                    pipe_fd = None
+                    pending.clear()
+                    time.sleep(0.2)
 
             # Periodic stats
             now = time.time()
             if now - last_stats >= STATS_INTERVAL:
                 elapsed = now - last_stats
                 kbps = bytes_written / 1024 / elapsed if elapsed > 0 else 0
-                logger.info("Mic stats: %.1f KB/s, %d packets dropped", kbps, packets_dropped)
+                logger.info("Mic stats: %.1f KB/s, %d stale bytes dropped",
+                            kbps, stale_bytes)
                 bytes_written = 0
-                packets_dropped = 0
+                stale_bytes = 0
                 last_stats = now
 
     except Exception as e:
@@ -514,8 +562,8 @@ def speaker_thread(shutdown_event: threading.Event, silence_gate: bool = False):
                     pipe_fd = os.open(SPK_PIPE, os.O_RDONLY | os.O_NONBLOCK)
                     # Shrink pipe buffer to reduce latency on pause/stop
                     try:
-                        fcntl.fcntl(pipe_fd, 1031, SPK_PIPE_BUF_SIZE)  # F_SETPIPE_SZ
-                        actual = fcntl.fcntl(pipe_fd, 1032)  # F_GETPIPE_SZ
+                        fcntl.fcntl(pipe_fd, F_SETPIPE_SZ, SPK_PIPE_BUF_SIZE)
+                        actual = fcntl.fcntl(pipe_fd, F_GETPIPE_SZ)
                         logger.info("Speaker pipe opened, buffer=%d bytes", actual)
                     except OSError:
                         logger.info("Speaker pipe opened for reading")
@@ -650,6 +698,32 @@ def get_local_ip_for_multicast() -> Optional[str]:
     if ip.startswith("192.168.123."):
         return ip
     return None
+
+
+def drain_fifo(path: str) -> int:
+    """Read and discard everything currently buffered in the named FIFO.
+
+    Used on the mic pipe: while no app is recording, PulseAudio's pipe source
+    is suspended and consumes nothing, so the FIFO fills with stale audio.
+    Draining it keeps a newly started recording fed with fresh audio instead
+    of seconds of old, gap-riddled data. Returns the number of bytes drained.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    drained = 0
+    try:
+        while True:
+            try:
+                if not os.read(fd, 65536):
+                    break
+                drained += 65536
+            except BlockingIOError:
+                break
+    finally:
+        os.close(fd)
+    return drained
 
 
 def _close_fd(fd: Optional[int]):

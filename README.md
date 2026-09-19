@@ -65,7 +65,8 @@ cd ~/g1-audio-driver
 ./install.sh --start
 
 # Test the mic (record 5 seconds)
-parecord --device=g1_microphone --format=s16le --rate=16000 --channels=1 -d 5 /tmp/test.wav
+# NOTE: parecord has no duration option — use timeout(1). "-d" means --device!
+timeout 5 parecord --device=g1_microphone /tmp/test.wav
 
 # Test the speaker (play it back through G1 head)
 paplay --device=g1_speaker /tmp/test.wav
@@ -154,7 +155,8 @@ To avoid wasting DDS bandwidth during silence, pass `--silence-gate` and the dri
 | PA suspends source/sink | Pipe closes, driver retries pipe open |
 | PA unloads module | Pipe EOF, driver retries pipe open |
 | Multicast timeout | Keeps waiting (PC1 may not be streaming yet) |
-| Pipe buffer full | Drops mic packet (no audible effect) |
+| Pipe buffer full (mic, source idle) | Drains stale FIFO contents so a new recording starts with fresh audio |
+| Partial pipe writes (mic) | Remainder kept and completed — no lost/misaligned bytes |
 | DDS PlayStream rejected (non-zero RPC code) | Logs code + first 3, suppresses, continues |
 | Thread crash | Main loop restarts with exponential backoff |
 | Thread crash > 50 times | Gives up on that thread |
@@ -238,7 +240,7 @@ journalctl --user -u g1-audio-driver -b         # since boot
 
 Normal operation logs throughput stats every 60 seconds:
 ```
-[g1audio] 14:30:00 INFO Mic stats: 31.3 KB/s, 0 packets dropped
+[g1audio] 14:30:00 INFO Mic stats: 31.3 KB/s, 0 stale bytes dropped
 [g1audio] 14:30:00 INFO Speaker stats: 28.7 KB/s
 ```
 
