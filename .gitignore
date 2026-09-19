@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime artifacts (driver creates these in /tmp, just in case)
+*.pipe
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

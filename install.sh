@@ -32,11 +32,13 @@ detect_dds_interface() {
 
 # ─── Auto-detect SDK path ───────────────────────────────────────────────────
 detect_sdk_path() {
-    # Check common locations
+    # Check common locations (underscore path is what the SDK repo uses)
     local candidates=(
         "$SCRIPT_DIR/../repos/unitree-sdk2-python"
+        "$HOME/unitree_sdk2_python"
         "$HOME/unitree-sdk2-python"
         "$HOME/unitree_sdk2-main"
+        "$HOME/unitree-sdk2-main"
     )
     for path in "${candidates[@]}"; do
         if [[ -d "$path/unitree_sdk2py" ]]; then
@@ -44,7 +46,7 @@ detect_sdk_path() {
             return
         fi
     done
-    echo "$HOME/unitree-sdk2-python"
+    echo "$HOME/unitree_sdk2_python"
 }
 
 # ─── Uninstall ────────────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ sys.path.insert(0, '$SDK_PATH')
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 " 2>/dev/null; then
     echo "❌ unitree_sdk2py not found at: $SDK_PATH"
-    echo "   Set UNITREE_SDK_PATH or install at ~/unitree-sdk2-python"
+    echo "   Set UNITREE_SDK_PATH or install at ~/unitree_sdk2_python"
     exit 1
 fi
 

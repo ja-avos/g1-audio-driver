@@ -29,9 +29,9 @@ PC1 (192.168.123.161)                  PC2 (192.168.123.164)
 +-----------------------+              +--------------------------------------+
 ```
 
-**Microphone path:** PC1's voice service streams raw PCM from the 4-mic array via multicast UDP (`239.168.123.161:5555`). The driver joins this multicast group, receives packets, and writes them into a FIFO pipe. PulseAudio reads the pipe as a standard audio source.
+**Microphone path:** PC1's voice service streams raw PCM from the 4-mic array via multicast UDP (`239.168.123.161:5555`) — but only while mic mode is active. The driver first enables mic mode (voice API 1008, `{"mode": 1}`), then joins the multicast group on the auto-detected robot-network interface (override with `G1_LOCAL_IP`), receives packets, and writes them into a FIFO pipe. PulseAudio reads the pipe as a standard audio source.
 
-**Speaker path:** PulseAudio writes audio to a FIFO pipe. The driver reads 50ms chunks from the pipe and sends them to PC1 via the DDS `PlayStream` RPC (API 1003). The head speaker plays them in real-time.
+**Speaker path:** PulseAudio writes audio to a FIFO pipe. The driver reads 200ms chunks (6400 bytes — the same chunk size as the proven `play_wav_request` script) from the pipe and sends them to PC1 via the DDS `PlayStream` RPC (API 1003), checking each RPC return code. The head speaker plays them in real-time.
 
 ## Audio Format
 
@@ -46,13 +46,13 @@ Both directions use the same format:
 | PA format string | `s16le` |
 
 Multicast mic packets: 5,120 bytes each (2,560 samples = 160ms)
-PlayStream chunks: 1,600 bytes each (800 samples = 50ms)
+PlayStream chunks: 6,400 bytes each (3,200 samples = 200ms)
 
 ## Prerequisites
 
 - **Ubuntu 20.04** on PC2 (Jetson Orin NX)
 - **PulseAudio** with `module-pipe-source` and `module-pipe-sink` (included by default)
-- **Unitree SDK2 Python** (`unitree_sdk2py`) — install at `~/unitree-sdk2-python` or set `UNITREE_SDK_PATH`
+- **Unitree SDK2 Python** (`unitree_sdk2py`) — required for both directions (mic-mode activation + speaker PlayStream). Install at `~/unitree_sdk2_python` or set `UNITREE_SDK_PATH`
 - **Network**: `eth0` on `192.168.123.0/24` with DDS and multicast enabled
 - **PC1 voice service** running (provides mic stream and PlayStream endpoint)
 
@@ -82,7 +82,7 @@ cd ~/g1-audio-driver
 
 The installer:
 1. Checks PulseAudio is running with pipe modules available
-2. Checks `unitree_sdk2py` is importable
+2. Checks `unitree_sdk2py` is importable (required for mic mode and speaker)
 3. Copies the systemd service to `~/.config/systemd/user/`
 4. Enables auto-start on login
 
@@ -103,10 +103,11 @@ journalctl --user -u g1-audio-driver -f
 ### Manual run (foreground)
 
 ```bash
-python3 g1_audio_driver.py              # both mic and speaker
-python3 g1_audio_driver.py --no-mic     # speaker only
-python3 g1_audio_driver.py --no-speaker # mic only
-python3 g1_audio_driver.py --verbose    # debug logging
+python3 g1_audio_driver.py                 # both mic and speaker
+python3 g1_audio_driver.py --no-speaker    # mic only
+python3 g1_audio_driver.py --no-mic        # speaker only
+python3 g1_audio_driver.py --silence-gate  # pause speaker stream during silence
+python3 g1_audio_driver.py --verbose       # debug logging
 ```
 
 ### Set as default device
@@ -116,19 +117,19 @@ pactl set-default-source g1_microphone
 pactl set-default-sink g1_speaker
 ```
 
-### SDK path
+### Environment variables
 
-By default the driver looks for `unitree_sdk2py` at `~/unitree-sdk2-python`. Override with:
-
-```bash
-export UNITREE_SDK_PATH=/path/to/unitree-sdk2-python
-```
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `G1_LOCAL_IP` | auto-detect | Local IP used to join the mic multicast group (auto-detected from the `192.168.123.*` interface) |
+| `G1_DDS_INTERFACE` | `eth0` | Network interface for DDS |
+| `UNITREE_SDK_PATH` | auto-detect | Path to `unitree_sdk2_python` (checked: `~/unitree_sdk2_python`, `~/unitree-sdk2-python`) |
 
 ## How It Works
 
 ### Mic Activation
 
-The G1's mic array doesn't stream by default. The driver activates it by calling voice service API 1008 with `{"mode": 1}`. When the driver stops, it sends `{"mode": 2}` to disable the mic.
+The G1's mic array only streams while mic mode is active. The driver enables it by calling voice service API 1008 with `{"mode": 1}` at startup. When the driver stops, it sends `{"mode": 2}` to disable the mic.
 
 | Mode | Behavior |
 |------|----------|
@@ -144,7 +145,7 @@ PulseAudio's `module-pipe-source` and `module-pipe-sink` use Unix FIFO files as 
 
 ### Silence Gating (Speaker)
 
-To avoid wasting DDS bandwidth during silence, the driver monitors audio RMS. After 300ms of continuous silence, it stops sending data. Audio resumes instantly when non-silent data arrives.
+To avoid wasting DDS bandwidth during silence, pass `--silence-gate` and the driver monitors audio RMS. After 300ms of continuous silence, it stops sending data. Audio resumes instantly when non-silent data arrives. **Off by default** — without the flag, all audio (including silence) is sent to the speaker, matching the behavior of the proven `play_wav_request` script.
 
 ### Error Recovery
 
@@ -154,7 +155,7 @@ To avoid wasting DDS bandwidth during silence, the driver monitors audio RMS. Af
 | PA unloads module | Pipe EOF, driver retries pipe open |
 | Multicast timeout | Keeps waiting (PC1 may not be streaming yet) |
 | Pipe buffer full | Drops mic packet (no audible effect) |
-| DDS PlayStream error | Logs first 3, suppresses, continues |
+| DDS PlayStream rejected (non-zero RPC code) | Logs code + first 3, suppresses, continues |
 | Thread crash | Main loop restarts with exponential backoff |
 | Thread crash > 50 times | Gives up on that thread |
 | PulseAudio restart | systemd restarts the driver service |
@@ -168,8 +169,8 @@ The main loop checks thread liveness every 3 seconds. Dead threads are restarted
 | Path | Latency |
 |------|---------|
 | Mic to PulseAudio | ~160ms (one multicast packet) |
-| PulseAudio to Speaker | ~50ms (one PlayStream chunk) + ~5-10ms DDS overhead |
-| Round-trip (mic to speaker) | ~200-250ms |
+| PulseAudio to Speaker | ~200ms (one PlayStream chunk) + ~5-10ms DDS overhead |
+| Round-trip (mic to speaker) | ~350-400ms |
 
 ## Troubleshooting
 
@@ -192,29 +193,27 @@ systemctl --user restart g1-audio-driver
 ### No mic audio
 
 ```bash
-# Check mic mode is enabled
-python3 -c "
-import sys, json, os
-sys.path.insert(0, os.environ.get('UNITREE_SDK_PATH', os.path.expanduser('~/unitree-sdk2-python')))
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-from unitree_sdk2py.rpc.client import Client
-ChannelFactoryInitialize(0, 'eth0')
-v = Client('voice', False); v.SetTimeout(3.0); v._SetApiVerson('1.0.0.0')
-v._RegistApi(1007, 0)
-print(v._Call(1007, json.dumps({})))
-"
+# Check the driver auto-detected the right multicast interface IP
+journalctl --user -u g1-audio-driver -n 20 | grep multicast
 
-# Check multicast data flowing
+# Check multicast data flowing (auto-detects the interface like the driver)
 timeout 3 python3 -c "
-import socket, struct
+import socket
+ip = '0.0.0.0'
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as p:
+        p.connect(('192.168.123.161', 1))
+        cand = p.getsockname()[0]
+        if cand.startswith('192.168.123.'): ip = cand
+except OSError: pass
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('', 5555))
 s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-    struct.pack('4s4s', socket.inet_aton('239.168.123.161'), socket.inet_aton('192.168.123.164')))
+    socket.inet_aton('239.168.123.161') + socket.inet_aton(ip))
 s.settimeout(3)
 d, a = s.recvfrom(65535)
-print(f'OK: {len(d)} bytes from {a}')
+print(f'OK: {len(d)} bytes from {a} via {ip}')
 "
 ```
 
@@ -225,8 +224,8 @@ print(f'OK: {len(d)} bytes from {a}')
 paplay --device=g1_speaker /usr/share/sounds/freedesktop/stereo/bell.oga 2>/dev/null \
   || echo "Test file not found, try: speaker-test -D pulse -t sine -f 440 -l 1"
 
-# Check driver logs for PlayStream errors
-journalctl --user -u g1-audio-driver --since "5 min ago" | grep -i error
+# Check driver logs for PlayStream rejections (non-zero RPC codes)
+journalctl --user -u g1-audio-driver --since "5 min ago" | grep -iE "error|rejected"
 ```
 
 ## Logs

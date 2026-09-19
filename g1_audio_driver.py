@@ -25,14 +25,22 @@ Audio format (both directions): 16-bit signed LE, mono, 16 kHz (32 KB/s)
 Requirements:
   - PulseAudio with module-pipe-source and module-pipe-sink
   - Unitree SDK2 Python (unitree_sdk2py) accessible on PYTHONPATH
+    (needed by both directions: mic-mode activation and speaker PlayStream)
   - Network: DDS interface connected to 192.168.123.0/24 (set G1_DDS_INTERFACE if not eth0)
   - PC1 voice service running (provides mic multicast + PlayStream)
 
 Usage:
-  python3 g1_audio_driver.py              # both mic and speaker
-  python3 g1_audio_driver.py --no-mic     # speaker only
-  python3 g1_audio_driver.py --no-speaker # mic only
-  python3 g1_audio_driver.py --verbose    # extra debug logging
+  python3 g1_audio_driver.py                 # both mic and speaker
+  python3 g1_audio_driver.py --no-mic        # speaker only
+  python3 g1_audio_driver.py --no-speaker    # mic only
+  python3 g1_audio_driver.py --silence-gate  # pause speaker stream during silence
+  python3 g1_audio_driver.py --verbose       # extra debug logging
+
+Environment:
+  G1_LOCAL_IP        Local IP used to join the mic multicast group
+                     (default: auto-detect the 192.168.123.* interface)
+  G1_DDS_INTERFACE   Network interface for DDS (default: eth0)
+  UNITREE_SDK_PATH   Path to unitree_sdk2_python (default: auto-detect)
 
 Systemd:
   systemctl --user start g1-audio-driver
@@ -49,7 +57,6 @@ import os
 import select
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -57,8 +64,16 @@ import time
 from typing import Optional, Tuple
 
 # ─── SDK path ─────────────────────────────────────────────────────────────────
-SDK_PATH = os.environ.get("UNITREE_SDK_PATH",
-                          os.path.expanduser("~/unitree-sdk2-python"))
+def _default_sdk_path() -> str:
+    """Pick the first SDK location that actually contains unitree_sdk2py."""
+    for candidate in ("~/unitree_sdk2_python", "~/unitree-sdk2-python"):
+        path = os.path.expanduser(candidate)
+        if os.path.isdir(os.path.join(path, "unitree_sdk2py")):
+            return path
+    return os.path.expanduser("~/unitree_sdk2_python")
+
+
+SDK_PATH = os.environ.get("UNITREE_SDK_PATH", _default_sdk_path())
 if SDK_PATH not in sys.path:
     sys.path.insert(0, SDK_PATH)
 
@@ -72,8 +87,10 @@ logger = logging.getLogger("g1audio")
 # Network
 MULTICAST_GROUP = "239.168.123.161"     # PC1 streams mic audio here
 MULTICAST_PORT = 5555                   # UDP port for multicast mic stream
-LOCAL_IP = "192.168.123.164"            # PC2 address (DDS interface)
 DDS_INTERFACE = os.environ.get("G1_DDS_INTERFACE", "eth0")
+# Local IP used to join the multicast group. Auto-detected at runtime by
+# probing the route toward PC1 (192.168.123.161); override with G1_LOCAL_IP.
+LOCAL_IP_OVERRIDE = os.environ.get("G1_LOCAL_IP")
 
 # PCM format — same in both directions
 SAMPLE_RATE = 16000                     # Hz
@@ -84,12 +101,14 @@ BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH  # 32000
 # Multicast packets from PC1 are 5120 bytes each (2560 samples = 160ms)
 MULTICAST_PACKET_SIZE = 5120
 
-# PlayStream chunking — must be small enough for real-time delivery
-PLAYSTREAM_CHUNK_BYTES = 1600           # 800 samples = 50ms at 16 kHz
-PLAYSTREAM_CHUNK_MS = 50
-PLAYSTREAM_CHUNK_SECS = PLAYSTREAM_CHUNK_MS / 1000.0
+# PlayStream chunking — 6400 bytes (3200 samples = 200ms at 16 kHz).
+# This matches the chunk size used by the proven play_wav_request script;
+# smaller chunks (e.g. 50ms) are not reliably played by PC1.
+PLAYSTREAM_CHUNK_BYTES = 6400           # 3200 samples = 200ms at 16 kHz
+PLAYSTREAM_CHUNK_SECS = PLAYSTREAM_CHUNK_BYTES / BYTES_PER_SEC
 
-# Silence detection for speaker (avoids sending silence to DDS endlessly)
+# Silence detection for speaker (avoids sending silence to DDS endlessly).
+# Disabled by default — only active with --silence-gate.
 SILENCE_RMS_THRESHOLD = 100            # below this RMS, audio is considered silence
 SILENCE_GATE_SECS = 0.3               # stop sending after this many seconds of silence
 
@@ -173,14 +192,15 @@ class DDSAudio:
         self.init()
         return self._voice._Call(API_GET_MODE, json.dumps({}))
 
-    def play_stream(self, app_name: str, stream_id: str, pcm_data: bytes):
-        """Send a PCM chunk to the G1 speaker. Handles bytes/list conversion."""
+    def play_stream(self, app_name: str, stream_id: str, pcm_data: bytes) -> int:
+        """Send a PCM chunk to the G1 speaker. Returns the RPC code (0=success)."""
         self.init()
         try:
-            self._audio.PlayStream(app_name, stream_id, pcm_data)
+            code, _ = self._audio.PlayStream(app_name, stream_id, pcm_data)
         except TypeError:
             # Some SDK versions need list instead of bytes
-            self._audio.PlayStream(app_name, stream_id, list(pcm_data))
+            code, _ = self._audio.PlayStream(app_name, stream_id, list(pcm_data))
+        return code
 
     def play_stop(self, app_name: str):
         """Stop an active PlayStream."""
@@ -313,11 +333,13 @@ def mic_thread(shutdown_event: threading.Event):
     """Capture multicast mic audio and feed it into the PulseAudio source pipe.
 
     Lifecycle:
-      1. Enable mic mode on PC1 (voice API 1008 mode=1)
-      2. Join multicast group 239.168.123.161:5555
-      3. Open the FIFO pipe for writing (non-blocking)
-      4. Loop: recv UDP packet → write to pipe
-      5. On shutdown: close pipe, leave multicast, disable mic mode
+      1. Enable mic mode on PC1 (voice API 1008 mode=1) — required: PC1 only
+         streams the mic array while this mode is active
+      2. Auto-detect the local IP on the robot network (or use G1_LOCAL_IP)
+      3. Join multicast group 239.168.123.161:5555 on that interface
+      4. Open the FIFO pipe for writing (non-blocking)
+      5. Loop: recv UDP packet → write to pipe
+      6. On shutdown: close pipe, leave multicast, disable mic mode
 
     Error handling:
       - BrokenPipeError: PA suspended the source → close and retry pipe
@@ -327,12 +349,25 @@ def mic_thread(shutdown_event: threading.Event):
     """
     logger.info("Mic thread starting")
 
-    # Activate mic streaming on PC1
+    # Activate mic streaming on PC1 — without this, no multicast data flows
     code = dds.set_mode(1)
     if code != 0:
         logger.warning("Could not enable mic mode (code=%d) — mic may not stream", code)
     else:
         logger.info("Mic mode enabled (mode=1)")
+
+    # Resolve the interface IP for the multicast join
+    if LOCAL_IP_OVERRIDE:
+        local_ip = LOCAL_IP_OVERRIDE
+        logger.info("Using G1_LOCAL_IP=%s for multicast join", local_ip)
+    else:
+        local_ip = get_local_ip_for_multicast()
+        if local_ip:
+            logger.info("Auto-detected multicast interface IP: %s", local_ip)
+        else:
+            local_ip = "0.0.0.0"
+            logger.warning("No 192.168.123.* interface found — OS will pick the "
+                           "multicast interface. Set G1_LOCAL_IP if no mic audio.")
 
     time.sleep(1)  # give PC1 time to start streaming
 
@@ -346,15 +381,17 @@ def mic_thread(shutdown_event: threading.Event):
         # Create and configure multicast socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
         # Increase receive buffer to reduce drops during pipe-reopen gaps
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         sock.bind(("", MULTICAST_PORT))
-        mreq = struct.pack("4s4s",
-            socket.inet_aton(MULTICAST_GROUP),
-            socket.inet_aton(LOCAL_IP))
+        mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton(local_ip)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(2.0)
-        logger.info("Joined multicast %s:%d", MULTICAST_GROUP, MULTICAST_PORT)
+        logger.info("Joined multicast %s:%d via %s", MULTICAST_GROUP, MULTICAST_PORT, local_ip)
 
         while not shutdown_event.is_set():
             # (Re)open pipe if needed — non-blocking so we don't hang if PA isn't reading
@@ -433,31 +470,34 @@ def mic_thread(shutdown_event: threading.Event):
 
 
 # ─── Speaker thread: PulseAudio sink → FIFO → DDS PlayStream ─────────────────
-def speaker_thread(shutdown_event: threading.Event):
+def speaker_thread(shutdown_event: threading.Event, silence_gate: bool = False):
     """Read PCM from the PulseAudio sink pipe and send to the G1 speaker.
 
     Lifecycle:
       1. Open the FIFO pipe for reading (blocks until PA writes)
-      2. Read PLAYSTREAM_CHUNK_BYTES at a time
-      3. If audio is not silence, send via DDS PlayStream
-      4. Pace sends at ~50ms intervals to match real-time playback
+      2. Read PLAYSTREAM_CHUNK_BYTES (200ms) at a time
+      3. Send each chunk via DDS PlayStream, checking the RPC return code
+      4. Pace sends at real-time rate (200ms per 6400-byte chunk)
       5. When pipe EOF (PA removed sink), close and retry
 
-    Silence gating:
-      To avoid burning DDS bandwidth and keeping the speaker powered on during
-      idle, we detect silence (RMS < threshold) and stop sending after
-      SILENCE_GATE_SECS. Audio resumes instantly when non-silent data arrives.
+    Chunking matches the proven play_wav_request script: 6400-byte chunks
+    (200ms at 16 kHz) with wall-clock pacing.
+
+    Silence gating (opt-in via --silence-gate):
+      By default every chunk is sent, exactly like play_wav_request. With
+      --silence-gate, chunks below the RMS threshold stop being sent after
+      SILENCE_GATE_SECS of continuous silence, and PlayStop is issued.
 
     Error handling:
       - EOF on pipe: PA suspended/removed sink → close, PlayStop, retry
-      - DDS PlayStream errors: log once, continue (speaker may be busy)
+      - PlayStream non-zero RPC code or exception: logged, counted, continues
       - Any other error: log, clean up, retry with backoff
     """
     logger.info("Speaker thread starting")
     dds.init()
 
     APP_NAME = "g1drv"
-    stream_id = f"drv_{int(time.time())}"
+    stream_id = str(int(time.time() * 1000))
     bytes_read = 0
     last_stats = time.time()
     play_errors = 0
@@ -489,6 +529,11 @@ def speaker_thread(shutdown_event: threading.Event):
             # Wall-clock pacer: track when we "should" send the next chunk
             next_send = time.monotonic()
 
+            # Accumulate PCM into full PLAYSTREAM_CHUNK_BYTES chunks.
+            # Partial reads are kept across select() rounds — never discarded,
+            # because PulseAudio trickles data at real-time rate (~32 KB/s).
+            buf = bytearray()
+
             while not shutdown_event.is_set():
                 # Use select() to wait for data with a timeout (for shutdown checks)
                 try:
@@ -498,52 +543,41 @@ def speaker_thread(shutdown_event: threading.Event):
                 if not ready:
                     continue
 
-                # Read one full chunk — accumulate from non-blocking reads
-                buf = bytearray()
-                eof = False
-                deadline = time.monotonic() + 0.1  # 100ms max to fill one chunk
-                while len(buf) < PLAYSTREAM_CHUNK_BYTES:
-                    if shutdown_event.is_set():
-                        eof = True
-                        break
-                    try:
-                        chunk = os.read(pipe_fd, PLAYSTREAM_CHUNK_BYTES - len(buf))
-                        if not chunk:
-                            eof = True
-                            break
-                        buf.extend(chunk)
-                    except BlockingIOError:
-                        if time.monotonic() > deadline:
-                            break
-                        time.sleep(0.001)
-                        continue
+                # Read whatever is available (up to the rest of the chunk)
+                try:
+                    chunk = os.read(pipe_fd, PLAYSTREAM_CHUNK_BYTES - len(buf))
+                    if not chunk:
+                        break  # EOF: PA suspended/removed the sink
+                    buf.extend(chunk)
+                except BlockingIOError:
+                    continue
 
-                if eof:
-                    break
                 if len(buf) < PLAYSTREAM_CHUNK_BYTES:
-                    continue  # partial chunk, keep trying
+                    continue  # keep accumulating across rounds
 
                 data = bytes(buf)
+                buf.clear()
 
-                # Fast silence detection using array (avoids struct.unpack + Python sum)
-                samples = array.array('h', data)
-                # Check a subset for speed (every 4th sample)
-                energy = sum(s * s for s in samples[::4])
-                is_silence = energy < SILENCE_RMS_THRESHOLD * (len(samples) // 4)
+                if silence_gate:
+                    # Fast silence detection using array (avoids struct.unpack + Python sum)
+                    samples = array.array('h', data)
+                    # Check a subset for speed (every 4th sample)
+                    energy = sum(s * s for s in samples[::4])
+                    is_silence = energy < SILENCE_RMS_THRESHOLD * (len(samples) // 4)
 
-                if is_silence:
-                    if idle_since is None:
-                        idle_since = time.time()
-                    if time.time() - idle_since > SILENCE_GATE_SECS:
-                        if playing:
-                            dds.play_stop(APP_NAME)
-                            playing = False
-                            logger.debug("Speaker idle — silence gate active")
-                        # Reset pacer so we don't burst when audio resumes
-                        next_send = time.monotonic()
-                        continue
-                else:
-                    idle_since = None
+                    if is_silence:
+                        if idle_since is None:
+                            idle_since = time.time()
+                        if time.time() - idle_since > SILENCE_GATE_SECS:
+                            if playing:
+                                dds.play_stop(APP_NAME)
+                                playing = False
+                                logger.debug("Speaker idle — silence gate active")
+                            # Reset pacer so we don't burst when audio resumes
+                            next_send = time.monotonic()
+                            continue
+                    else:
+                        idle_since = None
 
                 # Wall-clock pacing: sleep only the remaining time until next_send
                 now = time.monotonic()
@@ -551,11 +585,20 @@ def speaker_thread(shutdown_event: threading.Event):
                     time.sleep(next_send - now)
                 next_send = max(time.monotonic(), next_send + PLAYSTREAM_CHUNK_SECS)
 
-                # Send to G1 speaker
+                # Send to G1 speaker and check the RPC return code
                 try:
-                    dds.play_stream(APP_NAME, stream_id, data)
-                    playing = True
-                    play_errors = 0
+                    code = dds.play_stream(APP_NAME, stream_id, data)
+                    if code != 0:
+                        play_errors += 1
+                        if play_errors <= 3:
+                            logger.warning("PlayStream rejected (code=%d, error %d)",
+                                           code, play_errors)
+                        elif play_errors == 4:
+                            logger.warning("PlayStream rejections continuing — "
+                                           "suppressing further logs")
+                    else:
+                        playing = True
+                        play_errors = 0
                 except Exception as e:
                     play_errors += 1
                     if play_errors <= 3:
@@ -583,7 +626,7 @@ def speaker_thread(shutdown_event: threading.Event):
                 playing = False
 
         # New stream ID for next pipe open
-        stream_id = f"drv_{int(time.time())}"
+        stream_id = str(int(time.time() * 1000))
         if not shutdown_event.is_set():
             time.sleep(0.5)
 
@@ -591,6 +634,24 @@ def speaker_thread(shutdown_event: threading.Event):
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
+def get_local_ip_for_multicast() -> Optional[str]:
+    """Auto-detect the local IP on the 192.168.123.0/24 (robot) network.
+
+    Opens a UDP socket "toward" PC1 so the OS picks the route, then reads the
+    local endpoint. No packets are actually sent. Same technique as the
+    proven record_wav script. Returns None if no such interface exists.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.168.123.161", 1))
+            ip = s.getsockname()[0]
+    except OSError:
+        return None
+    if ip.startswith("192.168.123."):
+        return ip
+    return None
+
+
 def _close_fd(fd: Optional[int]):
     """Safely close a file descriptor."""
     if fd is not None:
@@ -634,6 +695,7 @@ Examples:
   %(prog)s                  Start both mic and speaker
   %(prog)s --no-speaker     Mic only (e.g. for recording)
   %(prog)s --no-mic         Speaker only (e.g. for playback)
+  %(prog)s --silence-gate   Pause speaker stream during silence
   %(prog)s --verbose        Extra debug logging
 
 Systemd service:
@@ -645,6 +707,9 @@ Systemd service:
                         help="Disable virtual microphone (no G1 mic → PA source)")
     parser.add_argument("--no-speaker", action="store_true",
                         help="Disable virtual speaker (no PA sink → G1 speaker)")
+    parser.add_argument("--silence-gate", action="store_true",
+                        help="Stop sending audio to the speaker during silence "
+                             "(off by default — all audio is sent)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug-level logging")
     args = parser.parse_args()
@@ -668,10 +733,11 @@ Systemd service:
     logger.info("G1 Audio PulseAudio Driver")
     logger.info("  Microphone: %s", "disabled" if args.no_mic else "enabled")
     logger.info("  Speaker:    %s", "disabled" if args.no_speaker else "enabled")
+    logger.info("  SDK:        %s", SDK_PATH)
     logger.info("  PID:        %d", os.getpid())
     logger.info("=" * 56)
 
-    # Initialize DDS (needed by both threads)
+    # Initialize DDS (needed by both threads: mic-mode RPC + PlayStream)
     try:
         dds.init()
     except Exception as e:
@@ -681,11 +747,17 @@ Systemd service:
 
     threads = []
     restart_counts = {}
+    # Extra keyword args passed to each worker thread (used on start and restart)
+    thread_params = {
+        "mic": {},
+        "speaker": {"silence_gate": args.silence_gate},
+    }
 
     # Set up virtual microphone
     if not args.no_mic:
         if setup_pa_source():
             t = threading.Thread(target=mic_thread, args=(shutdown_event,),
+                                 kwargs=thread_params["mic"],
                                  name="mic", daemon=True)
             t.start()
             threads.append(t)
@@ -699,6 +771,7 @@ Systemd service:
     if not args.no_speaker:
         if setup_pa_sink():
             t = threading.Thread(target=speaker_thread, args=(shutdown_event,),
+                                 kwargs=thread_params["speaker"],
                                  name="speaker", daemon=True)
             t.start()
             threads.append(t)
@@ -748,6 +821,7 @@ Systemd service:
                     continue
 
                 new_t = threading.Thread(target=target, args=(shutdown_event,),
+                                         kwargs=thread_params[name],
                                          name=name, daemon=True)
                 new_t.start()
                 threads[i] = new_t
