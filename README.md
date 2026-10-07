@@ -129,7 +129,7 @@ pactl set-default-sink g1_speaker
 | `G1_SPK_PIPE_BUF_SIZE` | `8192` | Speaker FIFO pipe buffer size in bytes (smaller = lower latency) |
 | `G1_MIC_PIPE_BUF_SIZE` | `8192` | Mic FIFO pipe buffer size in bytes |
 | `G1_MIC_PENDING_CAP` | `5120` | Max mic bytes queued unwritten before dropping oldest |
-| `G1_PA_SINK_LATENCY_MSEC` | unset | If set, passes `latency_msec` to `module-pipe-sink` (e.g. `20`) for lower PA buffering |
+| `G1_PA_SINK_LATENCY_MSEC` | unset | If set, sizes the pipe-sink `fragment_size`/`buffer_size` to this many ms of audio (module-pipe-sink has no `latency_msec` arg). Falls back to defaults if the args are rejected |
 | `G1_SILENCE_RMS_THRESHOLD` | `100` | RMS threshold for silence gating |
 | `G1_SILENCE_GATE_SECS` | `0.3` | Seconds of silence before stopping speaker stream (with --silence-gate) |
 

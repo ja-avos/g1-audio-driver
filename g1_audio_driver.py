@@ -229,10 +229,18 @@ dds = DDSAudio()
 
 # ─── PulseAudio helpers ──────────────────────────────────────────────────────
 def pa_run(cmd: list) -> Tuple[bool, str]:
-    """Run a pactl/pacmd command. Returns (success, stdout)."""
+    """Run a pactl/pacmd command. Returns (success, output).
+
+    pactl reports failures on stderr, so include it in the returned text —
+    otherwise module-load errors show up as an empty message.
+    """
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return r.returncode == 0, r.stdout.strip()
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0 and err:
+            out = f"{out} | {err}" if out else err
+        return r.returncode == 0, out
     except subprocess.TimeoutExpired:
         logger.warning("PA command timed out: %s", " ".join(cmd))
         return False, "timeout"
@@ -321,15 +329,29 @@ def setup_pa_sink() -> bool:
         f"rate={SAMPLE_RATE}",
         f"channels={CHANNELS}",
     ]
-    # Optional PA-side latency tuning
+    # Optional PA-side buffering tuning. module-pipe-sink does NOT accept
+    # latency_msec — it takes byte sizes: fragment_size (one write/read chunk)
+    # and buffer_size (total FIFO-side buffer). G1_PA_SINK_LATENCY_MSEC is
+    # converted to a fragment_size of that many milliseconds of audio.
+    tuning_added = False
     pa_latency = os.environ.get("G1_PA_SINK_LATENCY_MSEC")
     if pa_latency:
         try:
-            if int(pa_latency) >= 0:
-                cmd_sink.append(f"latency_msec={pa_latency}")
+            msec = int(pa_latency)
+            if msec > 0:
+                frag = (BYTES_PER_SEC * msec // 1000) & ~1  # bytes, even-aligned
+                cmd_sink += [f"fragment_size={frag}", f"buffer_size={frag * 4}"]
+                tuning_added = True
+                logger.info("PA sink buffering: latency %dms → fragment=%dB buffer=%dB",
+                            msec, frag, frag * 4)
         except ValueError:
             logger.warning("Invalid G1_PA_SINK_LATENCY_MSEC=%r, ignoring", pa_latency)
     ok, out = pa_run(cmd_sink)
+    if not ok and tuning_added:
+        # Buffer-size args rejected (e.g. PipeWire's pulse compat) — retry with
+        # plain args so the driver still comes up.
+        logger.warning("PA sink load with buffer tuning failed (%s) — retrying defaults", out)
+        ok, out = pa_run(cmd_sink[:-2])
     if not ok:
         logger.error("Failed to load PA sink module: %s", out)
         return False
@@ -821,7 +843,8 @@ Systemd service:
     logger.info("  PID:        %d", os.getpid())
     # Log key tuning params
     logger.info("  Chunk bytes: %d (%.3fs)", PLAYSTREAM_CHUNK_BYTES, PLAYSTREAM_CHUNK_SECS)
-    logger.info("  SPK pipe buf: %d, PA sink latency_msec=%s", SPK_PIPE_BUF_SIZE, os.environ.get("G1_PA_SINK_LATENCY_MSEC") or "default")
+    logger.info("  SPK pipe buf: %d, PA sink latency target: %s ms",
+                SPK_PIPE_BUF_SIZE, os.environ.get("G1_PA_SINK_LATENCY_MSEC") or "module default")
     logger.info("=" * 56)
 
     # Initialize DDS (needed by both threads: mic-mode RPC + PlayStream)
