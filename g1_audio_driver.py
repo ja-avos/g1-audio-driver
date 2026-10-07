@@ -101,28 +101,29 @@ BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH  # 32000
 # Multicast packets from PC1 are 5120 bytes each (2560 samples = 160ms)
 MULTICAST_PACKET_SIZE = 5120
 
-# PlayStream chunking — 6400 bytes (3200 samples = 200ms at 16 kHz).
-# This matches the chunk size used by the proven play_wav_request script;
-# smaller chunks (e.g. 50ms) are not reliably played by PC1.
-PLAYSTREAM_CHUNK_BYTES = 6400           # 3200 samples = 200ms at 16 kHz
+# PlayStream chunking — configurable via env (bytes). Defaults: 6400 (200ms).
+# Proven baseline was 6400 (3200 samples=200ms). Smaller (e.g. 3200/1600) reduces latency.
+# Clamped to ≥1 sample and rounded to an even byte count (s16le mono = 2 bytes/sample).
+PLAYSTREAM_CHUNK_BYTES = max(2, int(os.environ.get("G1_PLAYSTREAM_CHUNK_BYTES", "6400"))) & ~1
 PLAYSTREAM_CHUNK_SECS = PLAYSTREAM_CHUNK_BYTES / BYTES_PER_SEC
 
 # Silence detection for speaker (avoids sending silence to DDS endlessly).
 # Disabled by default — only active with --silence-gate.
-SILENCE_RMS_THRESHOLD = 100            # below this RMS, audio is considered silence
-SILENCE_GATE_SECS = 0.3               # stop sending after this many seconds of silence
+SILENCE_RMS_THRESHOLD = int(os.environ.get("G1_SILENCE_RMS_THRESHOLD", "100"))
+SILENCE_GATE_SECS = float(os.environ.get("G1_SILENCE_GATE_SECS", "0.3"))
 
 # Pipe buffer size — smaller = less latency on pause, but too small causes drops
-# Default Linux pipe is 64KB (~2s at 32KB/s). We use 8KB (~250ms).
-SPK_PIPE_BUF_SIZE = 8192
+# Default Linux pipe is 64KB (~2s at 32KB/s). Configurable via env.
+SPK_PIPE_BUF_SIZE = int(os.environ.get("G1_SPK_PIPE_BUF_SIZE", "8192"))
 
 # Mic pipe staleness control. While no app is recording, the PA source is
 # suspended and consumes nothing: audio left in the FIFO goes stale and would
 # be played when a recording starts ("old audio + gap" artifact). We shrink the
 # FIFO buffer and cap our unwritten backlog so at most ~a few hundred ms of
 # stale audio can ever exist; the rest is drained (see drain_fifo).
-MIC_PIPE_BUF_SIZE = 8192                 # ~250ms — limits stale backlog in the FIFO
-MIC_PENDING_CAP = MULTICAST_PACKET_SIZE  # at most one 160ms packet queued unwritten
+MIC_PIPE_BUF_SIZE = int(os.environ.get("G1_MIC_PIPE_BUF_SIZE", "8192"))                 # ~250ms default
+# Backlog cap in bytes — even-rounded so trimming never splits a 16-bit sample
+MIC_PENDING_CAP = max(2, int(os.environ.get("G1_MIC_PENDING_CAP", str(MULTICAST_PACKET_SIZE)))) & ~1
 
 # Linux fcntl pipe-buffer commands (not exposed by Python's fcntl on old kernels)
 F_SETPIPE_SZ = 1031
@@ -312,14 +313,23 @@ def setup_pa_sink() -> bool:
     pa_unload_by_pipe(SPK_PIPE)
     cleanup_pipe(SPK_PIPE)
 
-    ok, out = pa_run([
+    cmd_sink = [
         "pactl", "load-module", "module-pipe-sink",
         f"sink_name={PA_SINK_NAME}",
         f"file={SPK_PIPE}",
         "format=s16le",
         f"rate={SAMPLE_RATE}",
         f"channels={CHANNELS}",
-    ])
+    ]
+    # Optional PA-side latency tuning
+    pa_latency = os.environ.get("G1_PA_SINK_LATENCY_MSEC")
+    if pa_latency:
+        try:
+            if int(pa_latency) >= 0:
+                cmd_sink.append(f"latency_msec={pa_latency}")
+        except ValueError:
+            logger.warning("Invalid G1_PA_SINK_LATENCY_MSEC=%r, ignoring", pa_latency)
+    ok, out = pa_run(cmd_sink)
     if not ok:
         logger.error("Failed to load PA sink module: %s", out)
         return False
@@ -809,6 +819,9 @@ Systemd service:
     logger.info("  Speaker:    %s", "disabled" if args.no_speaker else "enabled")
     logger.info("  SDK:        %s", SDK_PATH)
     logger.info("  PID:        %d", os.getpid())
+    # Log key tuning params
+    logger.info("  Chunk bytes: %d (%.3fs)", PLAYSTREAM_CHUNK_BYTES, PLAYSTREAM_CHUNK_SECS)
+    logger.info("  SPK pipe buf: %d, PA sink latency_msec=%s", SPK_PIPE_BUF_SIZE, os.environ.get("G1_PA_SINK_LATENCY_MSEC") or "default")
     logger.info("=" * 56)
 
     # Initialize DDS (needed by both threads: mic-mode RPC + PlayStream)

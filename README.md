@@ -125,6 +125,13 @@ pactl set-default-sink g1_speaker
 | `G1_LOCAL_IP` | auto-detect | Local IP used to join the mic multicast group (auto-detected from the `192.168.123.*` interface) |
 | `G1_DDS_INTERFACE` | `eth0` | Network interface for DDS |
 | `UNITREE_SDK_PATH` | auto-detect | Path to `unitree_sdk2_python` (checked: `~/unitree_sdk2_python`, `~/unitree-sdk2-python`) |
+| `G1_PLAYSTREAM_CHUNK_BYTES` | `6400` | Speaker PlayStream chunk size in bytes (6400=200ms, 3200=100ms, 1600=50ms). Smaller = lower latency, higher risk of drops |
+| `G1_SPK_PIPE_BUF_SIZE` | `8192` | Speaker FIFO pipe buffer size in bytes (smaller = lower latency) |
+| `G1_MIC_PIPE_BUF_SIZE` | `8192` | Mic FIFO pipe buffer size in bytes |
+| `G1_MIC_PENDING_CAP` | `5120` | Max mic bytes queued unwritten before dropping oldest |
+| `G1_PA_SINK_LATENCY_MSEC` | unset | If set, passes `latency_msec` to `module-pipe-sink` (e.g. `20`) for lower PA buffering |
+| `G1_SILENCE_RMS_THRESHOLD` | `100` | RMS threshold for silence gating |
+| `G1_SILENCE_GATE_SECS` | `0.3` | Seconds of silence before stopping speaker stream (with --silence-gate) |
 
 ## How It Works
 

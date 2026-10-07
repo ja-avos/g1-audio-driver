@@ -14,6 +14,19 @@ StartLimitBurst=10
 Environment=PYTHONUNBUFFERED=1
 Environment=UNITREE_SDK_PATH=__UNITREE_SDK_PATH__
 Environment=G1_DDS_INTERFACE=__DDS_INTERFACE__
+# ── Latency tuning (uncomment to override defaults) ──────────────────────────
+# Speaker PlayStream chunk: 6400=200ms (default), 3200=100ms, 1600=50ms
+#Environment=G1_PLAYSTREAM_CHUNK_BYTES=3200
+# Speaker FIFO pipe buffer in bytes (default 8192)
+#Environment=G1_SPK_PIPE_BUF_SIZE=4096
+# PulseAudio pipe-sink latency hint in ms (default: module default)
+#Environment=G1_PA_SINK_LATENCY_MSEC=20
+# ── Mic tuning ───────────────────────────────────────────────────────────────
+#Environment=G1_MIC_PIPE_BUF_SIZE=8192
+#Environment=G1_MIC_PENDING_CAP=5120
+# ── Silence gate tuning ──────────────────────────────────────────────────────
+#Environment=G1_SILENCE_RMS_THRESHOLD=100
+#Environment=G1_SILENCE_GATE_SECS=0.3
 # Give the driver time to clean up PA modules on stop
 TimeoutStopSec=10
 # Logging
