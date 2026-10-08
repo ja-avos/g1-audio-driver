@@ -14,16 +14,22 @@ StartLimitBurst=10
 Environment=PYTHONUNBUFFERED=1
 Environment=UNITREE_SDK_PATH=__UNITREE_SDK_PATH__
 Environment=G1_DDS_INTERFACE=__DDS_INTERFACE__
-# ── Latency tuning (uncomment to override defaults) ──────────────────────────
-# Speaker PlayStream chunk: 6400=200ms (default), 3200=100ms, 1600=50ms
-#Environment=G1_PLAYSTREAM_CHUNK_BYTES=3200
-# Early-flush floor in bytes (320=10ms): send partial pieces when the pipe is
-# empty instead of waiting to fill a full chunk — cuts accumulation delay
-#Environment=G1_PLAYSTREAM_MIN_CHUNK_BYTES=320
-# Speaker FIFO pipe buffer in bytes (default 8192)
-#Environment=G1_SPK_PIPE_BUF_SIZE=4096
-# PulseAudio pipe-sink buffering target in ms (converted to fragment_size/buffer_size)
-#Environment=G1_PA_SINK_LATENCY_MSEC=20
+# ── Latency tuning — Run 5 config (lowest verified stable) ───────────────────
+# Speaker PlayStream max piece: 1600 bytes = 50ms
+Environment=G1_PLAYSTREAM_CHUNK_BYTES=1600
+# Early-flush floor: send as soon as 320 bytes (10ms) are buffered and the
+# pipe is empty — removes accumulation delay
+Environment=G1_PLAYSTREAM_MIN_CHUNK_BYTES=320
+# Speaker FIFO pipe buffer: 2048 bytes = 64ms
+Environment=G1_SPK_PIPE_BUF_SIZE=2048
+# PulseAudio pipe-sink fragment/buffer target: 10ms fragments
+Environment=G1_PA_SINK_LATENCY_MSEC=10
+
+# ── Experimental: more aggressive (uncomment to try — watch logs for
+#    "PlayStream rejected" and listen for glitches; revert if unstable) ──────
+#Environment=G1_PLAYSTREAM_MIN_CHUNK_BYTES=160
+#Environment=G1_PA_SINK_LATENCY_MSEC=5
+
 # ── Mic tuning ───────────────────────────────────────────────────────────────
 #Environment=G1_MIC_PIPE_BUF_SIZE=8192
 #Environment=G1_MIC_PENDING_CAP=5120
