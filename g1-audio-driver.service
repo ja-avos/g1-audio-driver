@@ -17,6 +17,9 @@ Environment=G1_DDS_INTERFACE=__DDS_INTERFACE__
 # ── Latency tuning (uncomment to override defaults) ──────────────────────────
 # Speaker PlayStream chunk: 6400=200ms (default), 3200=100ms, 1600=50ms
 #Environment=G1_PLAYSTREAM_CHUNK_BYTES=3200
+# Early-flush floor in bytes (320=10ms): send partial pieces when the pipe is
+# empty instead of waiting to fill a full chunk — cuts accumulation delay
+#Environment=G1_PLAYSTREAM_MIN_CHUNK_BYTES=320
 # Speaker FIFO pipe buffer in bytes (default 8192)
 #Environment=G1_SPK_PIPE_BUF_SIZE=4096
 # PulseAudio pipe-sink buffering target in ms (converted to fragment_size/buffer_size)

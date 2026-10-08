@@ -107,6 +107,20 @@ MULTICAST_PACKET_SIZE = 5120
 PLAYSTREAM_CHUNK_BYTES = max(2, int(os.environ.get("G1_PLAYSTREAM_CHUNK_BYTES", "6400"))) & ~1
 PLAYSTREAM_CHUNK_SECS = PLAYSTREAM_CHUNK_BYTES / BYTES_PER_SEC
 
+# Flush mode: minimum piece to send before the full chunk is assembled.
+# PA trickles data into the FIFO at real-time rate, so waiting for a full
+# chunk adds up to PLAYSTREAM_CHUNK_SECS of accumulation delay. If
+# G1_PLAYSTREAM_MIN_CHUNK_BYTES is set lower than the chunk size, the driver
+# sends a partial piece as soon as the pipe has nothing more queued.
+# 0 (default) = old behavior (always wait for a full chunk).
+_min_chunk = max(0, int(os.environ.get("G1_PLAYSTREAM_MIN_CHUNK_BYTES", "0")))
+if _min_chunk > 0:
+    STREAM_MIN_CHUNK_BYTES = max(2, min(_min_chunk, PLAYSTREAM_CHUNK_BYTES)) & ~1
+    STREAM_FLUSH_EARLY = STREAM_MIN_CHUNK_BYTES < PLAYSTREAM_CHUNK_BYTES
+else:
+    STREAM_MIN_CHUNK_BYTES = PLAYSTREAM_CHUNK_BYTES
+    STREAM_FLUSH_EARLY = False
+
 # Silence detection for speaker (avoids sending silence to DDS endlessly).
 # Disabled by default — only active with --silence-gate.
 SILENCE_RMS_THRESHOLD = int(os.environ.get("G1_SILENCE_RMS_THRESHOLD", "100"))
@@ -609,9 +623,10 @@ def speaker_thread(shutdown_event: threading.Event, silence_gate: bool = False):
             # Wall-clock pacer: track when we "should" send the next chunk
             next_send = time.monotonic()
 
-            # Accumulate PCM into full PLAYSTREAM_CHUNK_BYTES chunks.
-            # Partial reads are kept across select() rounds — never discarded,
-            # because PulseAudio trickles data at real-time rate (~32 KB/s).
+            # Accumulate PCM into PLAYSTREAM_CHUNK_BYTES pieces (or smaller
+            # early-flush pieces — see STREAM_FLUSH_EARLY). Partial reads are
+            # kept across select() rounds — never discarded, because
+            # PulseAudio trickles data at real-time rate (~32 KB/s).
             buf = bytearray()
 
             while not shutdown_event.is_set():
@@ -633,7 +648,18 @@ def speaker_thread(shutdown_event: threading.Event, silence_gate: bool = False):
                     continue
 
                 if len(buf) < PLAYSTREAM_CHUNK_BYTES:
-                    continue  # keep accumulating across rounds
+                    # Early flush: if we have at least the minimum piece and
+                    # the pipe has nothing more queued, send now instead of
+                    # waiting to fill a full chunk (removes up to
+                    # PLAYSTREAM_CHUNK_SECS of accumulation delay).
+                    if not STREAM_FLUSH_EARLY or len(buf) < STREAM_MIN_CHUNK_BYTES:
+                        continue  # keep accumulating across rounds
+                    try:
+                        more, _, _ = select.select([pipe_fd], [], [], 0)
+                    except (ValueError, OSError):
+                        break
+                    if more:
+                        continue  # data still arriving — let the piece grow
 
                 data = bytes(buf)
                 buf.clear()
@@ -659,11 +685,13 @@ def speaker_thread(shutdown_event: threading.Event, silence_gate: bool = False):
                     else:
                         idle_since = None
 
-                # Wall-clock pacing: sleep only the remaining time until next_send
+                # Wall-clock pacing: sleep only the remaining time until next_send.
+                # Advance by the bytes actually sent so variable-size early-flush
+                # pieces aren't delayed by a full chunk period.
                 now = time.monotonic()
                 if next_send > now:
                     time.sleep(next_send - now)
-                next_send = max(time.monotonic(), next_send + PLAYSTREAM_CHUNK_SECS)
+                next_send = max(time.monotonic(), next_send + len(data) / BYTES_PER_SEC)
 
                 # Send to G1 speaker and check the RPC return code
                 try:
@@ -842,7 +870,9 @@ Systemd service:
     logger.info("  SDK:        %s", SDK_PATH)
     logger.info("  PID:        %d", os.getpid())
     # Log key tuning params
-    logger.info("  Chunk bytes: %d (%.3fs)", PLAYSTREAM_CHUNK_BYTES, PLAYSTREAM_CHUNK_SECS)
+    logger.info("  Chunk bytes: %d (%.3fs), min flush: %s", PLAYSTREAM_CHUNK_BYTES,
+                PLAYSTREAM_CHUNK_SECS,
+                f"{STREAM_MIN_CHUNK_BYTES} (early)" if STREAM_FLUSH_EARLY else "off")
     logger.info("  SPK pipe buf: %d, PA sink latency target: %s ms",
                 SPK_PIPE_BUF_SIZE, os.environ.get("G1_PA_SINK_LATENCY_MSEC") or "module default")
     logger.info("=" * 56)

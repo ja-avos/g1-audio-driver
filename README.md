@@ -126,6 +126,7 @@ pactl set-default-sink g1_speaker
 | `G1_DDS_INTERFACE` | `eth0` | Network interface for DDS |
 | `UNITREE_SDK_PATH` | auto-detect | Path to `unitree_sdk2_python` (checked: `~/unitree_sdk2_python`, `~/unitree-sdk2-python`) |
 | `G1_PLAYSTREAM_CHUNK_BYTES` | `6400` | Speaker PlayStream chunk size in bytes (6400=200ms, 3200=100ms, 1600=50ms). Smaller = lower latency, higher risk of drops |
+| `G1_PLAYSTREAM_MIN_CHUNK_BYTES` | `0` (off) | Early-flush floor in bytes. When set below the chunk size, the driver sends a partial piece as soon as the pipe is empty instead of waiting to fill a full chunk — removes up to one chunk-period of accumulation delay (e.g. `320` = 10ms) |
 | `G1_SPK_PIPE_BUF_SIZE` | `8192` | Speaker FIFO pipe buffer size in bytes (smaller = lower latency) |
 | `G1_MIC_PIPE_BUF_SIZE` | `8192` | Mic FIFO pipe buffer size in bytes |
 | `G1_MIC_PENDING_CAP` | `5120` | Max mic bytes queued unwritten before dropping oldest |
